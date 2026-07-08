@@ -1,0 +1,36 @@
+[Unit]
+Description=Wrappd backend (FastAPI top-lijst API)
+# Start pas nadat het netwerk klaar is; "wants" is zacht: Redis mag ook later komen,
+# de backend valt dan tijdelijk terug op de geheugen-cache.
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Draai NIET als root. Maak eerst een gebruiker aan (zie installatie-uitleg).
+User=wrappd
+Group=wrappd
+
+# Map waar main.py en watched.db staan. Alles start relatief hiervandaan.
+WorkingDirectory=/opt/Wrappd
+
+# --- Instellingen op één plek ---
+# Vervang de TMDB-key door je echte key. Laat REDIS_URL weg om puur in-memory te draaien.
+Environment=TMDB_API_KEY=zet-hier-je-echte-tmdb-key
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=DB_PATH=/opt/Wrappd/watched.db
+Environment=DEFAULT_LANG=en
+# Optioneel: strengheid van de Bayes-score en de OMDb-key
+# Environment=BAYES_M=500
+# Environment=OMDB_API_KEY=
+
+# Start de server. Gebruik het volledige pad naar uvicorn uit je virtualenv.
+ExecStart=/opt/Wrappd/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Herstart automatisch bij een crash, met 3s pauze ertussen.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
