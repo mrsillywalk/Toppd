@@ -14,44 +14,31 @@ Zonder API-key testen: MOCK_MODE=1 uvicorn main:app ...
 import os
 import json
 import asyncio
+import logging
 import sqlite3
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 
 import httpx
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+try:
+    import redis.asyncio as aioredis  # redis-py (pip install "redis>=5")
+except ImportError:
+    aioredis = None  # zonder pakket draait alles gewoon op geheugen
+
+log = logging.getLogger("wrappd")
+
 TMDB_KEY = os.environ.get("TMDB_API_KEY", "")
 OMDB_KEY = os.environ.get("OMDB_API_KEY", "")  # optioneel
 MOCK_MODE = os.environ.get("MOCK_MODE", "0") == "1"
 DB_PATH = os.environ.get("DB_PATH", "watched.db")  # SQLite-bestand voor kijklijsten
-DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "en")  # standaardtaal (korte code) als er geen wordt meegegeven
+DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "en-US")  # standaardtaal als er geen wordt meegegeven
+BAYES_M = float(os.environ.get("BAYES_M", "500"))  # drempel voor het Bayesiaanse gemiddelde (IMDb-methode)
+REDIS_URL = os.environ.get("REDIS_URL", "")  # bijv. redis://localhost:6379/0; leeg = alleen geheugen
 
 TMDB_BASE = "https://api.themoviedb.org/3"
-
-# Korte taalcodes die de APP stuurt -> volledige TMDB-codes.
-# De app hoeft zo niets te weten van TMDB's xx-XX-notatie; onbekende of lege
-# invoer valt terug op de standaard, zodat een typefout nooit een crash geeft.
-LANG_MAP = {
-    "en": "en-US",
-    "nl": "nl-NL",
-    "de": "de-DE",
-    "fr": "fr-FR",
-    "es": "es-ES",
-}
-
-
-def resolve_lang(code: Optional[str]) -> str:
-    """Zet een korte taalcode (en, nl, ...) om naar TMDB-formaat (en-US, ...).
-
-    Accepteert ook al-volledige codes (en-US) en hoofdletters (EN), en valt bij
-    onbekende of ontbrekende invoer terug op de standaardtaal.
-    """
-    if not code:
-        return LANG_MAP[DEFAULT_LANG]
-    key = code.strip().lower()[:2]        # 'nl-NL' of 'NL' -> 'nl'
-    return LANG_MAP.get(key, LANG_MAP[DEFAULT_LANG])
 
 app = FastAPI(
     title="Top-30 Films & Series API",
@@ -59,67 +46,155 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Cache: genres 24u, zoekresultaten 1u, persoon-lookups 24u
-# Persistent via Redis als REDIS_URL gezet is; anders in-memory (verdwijnt bij herstart).
-TTL_GENRE = 86400
-TTL_LIST = 3600
-TTL_PERSON = 86400
+# ---------------------------------------------------------------- cache
 
-# In-memory fallback-caches: gebruikt als Redis niet is geconfigureerd of onbereikbaar.
-_mem_genre = TTLCache(maxsize=8, ttl=TTL_GENRE)
-_mem_list = TTLCache(maxsize=512, ttl=TTL_LIST)
-_mem_person = TTLCache(maxsize=1024, ttl=TTL_PERSON)
-
-# Redis-verbinding: leeg = uit (dan puur in-memory).
-# Voorbeeld: REDIS_URL=redis://192.168.1.108:6379/0
-REDIS_URL = os.environ.get("REDIS_URL", "")
+# Eén Redis-client voor de hele app (lazy: pas verbinden als hij nodig is).
 _redis = None
-_MISS = object()  # sentinel: onderscheidt 'niet in cache' van een gecachte None
 
 
-async def get_redis():
-    """Geef de Redis-client terug, of None als Redis uit staat / de lib ontbreekt."""
+def get_redis():
+    """Geef de gedeelde Redis-client, of None als Redis niet is ingesteld."""
     global _redis
-    if not REDIS_URL:
+    if not REDIS_URL or aioredis is None:
         return None
     if _redis is None:
-        try:
-            import redis.asyncio as aioredis
-            # Korte timeouts: als Redis plat ligt, val snel terug op geheugen
-            # i.p.v. elk verzoek te laten hangen.
-            _redis = aioredis.from_url(
-                REDIS_URL, decode_responses=True,
-                socket_connect_timeout=2, socket_timeout=2,
-            )
-        except Exception:
-            return None
+        # decode_responses=True: we werken met strings (JSON), niet met bytes.
+        _redis = aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
     return _redis
 
 
-async def cache_get(key: str, mem_store: TTLCache):
-    """Haal een waarde uit Redis; val bij storing terug op de geheugen-cache."""
-    r = await get_redis()
-    if r is not None:
-        try:
-            raw = await r.get(key)
-            return json.loads(raw) if raw is not None else _MISS
-        except Exception:
-            pass  # Redis-hik -> geheugen proberen
-    return mem_store.get(key, _MISS)
+# Sentinel om een écht cache-gemis te onderscheiden van een opgeslagen None.
+# (Een 'niet gevonden'-persoon cachen we bewust als None, zodat we die lookup
+#  niet telkens opnieuw doen. Zonder deze truc zou None 'gemis' lijken.)
+MISS = object()
 
 
-async def cache_set(key: str, value, ttl: int, mem_store: TTLCache):
-    """Schrijf naar Redis (met vervaltijd); val bij storing terug op geheugen."""
-    r = await get_redis()
-    if r is not None:
-        try:
-            await r.set(key, json.dumps(value), ex=ttl)
-            return
-        except Exception:
-            pass  # Redis-hik -> geheugen gebruiken
-    mem_store[key] = value
+class Cache:
+    """
+    Cache met Redis als hoofdopslag en automatische terugval op geheugen.
+
+    - Staat Redis aan en is hij bereikbaar, dan is Redis leidend.
+    - Valt Redis weg (of is hij niet ingesteld), dan gebruikt dezelfde code
+      een lokale TTLCache. Geen crash, geen configuratie nodig.
+    - Waarden worden als JSON opgeslagen, verpakt in {"v": ...}, zodat een
+      opgeslagen None netjes terugkomt en niet als 'gemis' geldt.
+    """
+
+    def __init__(self, namespace: str, ttl: int, maxsize: int):
+        self.namespace = namespace
+        self.ttl = ttl
+        self.memory = TTLCache(maxsize=maxsize, ttl=ttl)  # de vangnet-opslag
+
+    def _key(self, key: Any) -> str:
+        raw = key if isinstance(key, str) else json.dumps(key, default=str)
+        return f"{self.namespace}:{raw}"
+
+    async def get(self, key: Any) -> Any:
+        """Geef de waarde terug, of de MISS-sentinel als hij er niet is."""
+        r = get_redis()
+        if r is not None:
+            try:
+                raw = await r.get(self._key(key))
+                return json.loads(raw)["v"] if raw is not None else MISS
+            except Exception as e:  # Redis onbereikbaar -> vangnet
+                log.warning("Redis get faalde (%s); val terug op geheugen", e)
+        return self.memory.get(key, MISS)
+
+    async def set(self, key: Any, value: Any) -> None:
+        r = get_redis()
+        if r is not None:
+            try:
+                await r.set(self._key(key), json.dumps({"v": value}, default=str), ex=self.ttl)
+                return
+            except Exception as e:  # Redis onbereikbaar -> vangnet
+                log.warning("Redis set faalde (%s); val terug op geheugen", e)
+        self.memory[key] = value
+
+
+# Cache: genres 24u, zoekresultaten 1u, persoon-lookups 24u
+genre_cache = Cache("genre", ttl=86400, maxsize=8)
+list_cache = Cache("list", ttl=3600, maxsize=512)
+person_cache = Cache("person", ttl=86400, maxsize=1024)
 
 MediaType = Literal["movie", "tv"]
+
+
+# ---------------------------------------------------------------- scores
+
+def bayesian_score(R: Optional[float], v: Optional[int], C: float, m: float) -> Optional[float]:
+    """
+    Bayesiaans gemiddelde (IMDb-methode).
+        score = (v/(v+m))*R + (m/(v+m))*C
+    R = rauwe rating, v = aantal stemmen, C = lijstgemiddelde, m = drempel (BAYES_M).
+    Titels met weinig stemmen worden naar C toe getrokken; titels met veel stemmen
+    houden bijna hun eigen R. Zo verslaat '9,5 uit 12 stemmen' geen klassieker.
+    """
+    if R is None or v is None:
+        return None
+    v = float(v)
+    return (v / (v + m)) * R + (m / (v + m)) * C
+
+
+# Elke bron is een LOS, UITSCHAKELBAAR blokje met eigen gewicht.
+# Nu alleen TMDB actief; Trakt/RT/IMDb later inpluggen MÉT licentie
+# (zet dan enabled=True en geef een gewicht). "value" geeft een 0-10-waarde
+# terug voor een titel, of None als die bron geen cijfer heeft.
+SCORE_SOURCES = [
+    {
+        "key": "tmdb",
+        "enabled": True,
+        "weight": 1.0,
+        "value": lambda it, ctx: bayesian_score(
+            it.get("tmdb_rating"), it.get("vote_count"), ctx["tmdb_mean"], ctx["bayes_m"]
+        ),
+    },
+    # Voorbeeld voor later (uit tot je een licentie + databron hebt):
+    # {"key": "trakt", "enabled": False, "weight": 0.0,
+    #  "value": lambda it, ctx: it.get("trakt_rating")},
+]
+
+
+def composite_score(it: dict, ctx: dict) -> tuple[Optional[float], dict]:
+    """
+    Combineer alle ingeschakelde bronnen tot één eindcijfer (gewogen gemiddelde).
+    Geeft (eindcijfer, losse-bronscores) terug. Bronnen zonder cijfer tellen niet mee,
+    zodat het gewicht netjes herverdeeld wordt over de bronnen die er wél zijn.
+    """
+    acc = 0.0
+    total_w = 0.0
+    per_source: dict[str, float] = {}
+    for src in SCORE_SOURCES:
+        if not src["enabled"] or src["weight"] <= 0:
+            continue
+        val = src["value"](it, ctx)
+        if val is None:
+            continue
+        per_source[src["key"]] = round(val, 3)
+        acc += val * src["weight"]
+        total_w += src["weight"]
+    if total_w == 0:
+        return None, per_source
+    return round(acc / total_w, 3), per_source
+
+
+def apply_scores(items: list[dict]) -> list[dict]:
+    """
+    Reken voor elke titel een samengesteld 'score'-veld uit en bewaar de losse
+    bronscores in 'score_sources' (voor controle). Werkt op KOPIEËN, zodat de
+    cache met rauwe TMDB-data niet vervuild raakt.
+    """
+    ratings = [it["tmdb_rating"] for it in items if it.get("tmdb_rating") is not None]
+    tmdb_mean = sum(ratings) / len(ratings) if ratings else 0.0
+    ctx = {"tmdb_mean": tmdb_mean, "bayes_m": BAYES_M}
+
+    scored = []
+    for it in items:
+        it = dict(it)  # kopie: raakt de cache niet aan
+        score, sources = composite_score(it, ctx)
+        it["score"] = score
+        it["score_sources"] = sources
+        scored.append(it)
+    return scored
 
 
 # ---------------------------------------------------------------- helpers
@@ -135,14 +210,14 @@ async def tmdb_get(client: httpx.AsyncClient, path: str, **params) -> dict:
 
 async def find_person_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
     """Zoek TMDB persoon-ID op naam (acteur of regisseur)."""
-    key = "person:" + name.strip().lower()
-    cached = await cache_get(key, _mem_person)
-    if cached is not _MISS:
+    key = name.strip().lower()
+    cached = await person_cache.get(key)
+    if cached is not MISS:
         return cached
     data = await tmdb_get(client, "/search/person", query=name)
     results = data.get("results", [])
     pid = results[0]["id"] if results else None
-    await cache_set(key, pid, TTL_PERSON, _mem_person)
+    await person_cache.set(key, pid)  # ook None cachen: 'niet gevonden' onthouden
     return pid
 
 
@@ -184,67 +259,6 @@ def mock_items(media_type: str) -> list[dict]:
     ]
 
 
-# ---------------------------------------------------------------- scoring
-
-# Ratingbronnen als losse, uitschakelbare blokjes met eigen gewicht.
-# Nu alleen TMDB; later voeg je hier bijv. "trakt" of "imdb" toe (mét licentie).
-# Elke bron leest z'n rauwe cijfer (0-10) en aantal stemmen uit een item.
-SCORE_SOURCES = {
-    "tmdb": {
-        "weight": 1.0,
-        "enabled": True,
-        "rating": lambda it: it.get("tmdb_rating"),
-        "votes": lambda it: it.get("vote_count") or 0,
-    },
-    # Voorbeeld voor later (uitgeschakeld):
-    # "trakt": {"weight": 0.5, "enabled": False,
-    #           "rating": lambda it: it.get("trakt_rating"),
-    #           "votes":  lambda it: it.get("trakt_votes") or 0},
-}
-
-# Bayes-drempel: hoeveel stemmen een bron "vertrouwt" voordat een titel
-# z'n eigen cijfer mag houden. Hoger = strenger voor obscure titels.
-BAYES_M = int(os.environ.get("BAYES_M", "500"))
-
-
-def bayesian_score(rating: float, votes: int, mean: float, m: int = BAYES_M) -> float:
-    """Trek titels met weinig stemmen naar het lijstgemiddelde toe (IMDb-methode).
-
-    score = (v/(v+m))*R + (m/(v+m))*C  — met R=cijfer, v=stemmen, C=gemiddelde.
-    """
-    v = max(votes, 0)
-    if v + m == 0:
-        return mean
-    return (v / (v + m)) * rating + (m / (v + m)) * mean
-
-
-def compute_composite(items: list[dict]) -> None:
-    """Bereken per item een samengesteld 'score'-veld over alle actieve bronnen.
-
-    Per bron wordt eerst het lijstgemiddelde (C) bepaald, dan een Bayes-cijfer,
-    en die worden gewogen samengevoegd. Werkt met 1 bron of met meerdere.
-    """
-    active = {name: s for name, s in SCORE_SOURCES.items() if s.get("enabled")}
-
-    # Lijstgemiddelde C per bron (alleen over titels die die bron hebben).
-    means = {}
-    for name, s in active.items():
-        vals = [s["rating"](it) for it in items if s["rating"](it) is not None]
-        means[name] = (sum(vals) / len(vals)) if vals else 0.0
-
-    for it in items:
-        total_w = 0.0
-        acc = 0.0
-        for name, s in active.items():
-            r = s["rating"](it)
-            if r is None:
-                continue  # bron ontbreekt voor deze titel -> sla over
-            b = bayesian_score(r, s["votes"](it), means[name])
-            acc += b * s["weight"]
-            total_w += s["weight"]
-        it["score"] = round(acc / total_w, 1) if total_w else it.get("tmdb_rating")
-
-
 # ---------------------------------------------------------------- watched (gezien)
 
 def db() -> sqlite3.Connection:
@@ -272,7 +286,21 @@ class WatchedIn(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "mock_mode": MOCK_MODE, "omdb_enabled": bool(OMDB_KEY)}
+    # Live checken of Redis echt bereikbaar is; anders draait de cache op geheugen.
+    cache_backend = "memory"
+    r = get_redis()
+    if r is not None:
+        try:
+            await r.ping()
+            cache_backend = "redis"
+        except Exception:
+            cache_backend = "memory (redis onbereikbaar)"
+    return {
+        "status": "ok",
+        "mock_mode": MOCK_MODE,
+        "omdb_enabled": bool(OMDB_KEY),
+        "cache_backend": cache_backend,
+    }
 
 
 @app.post("/api/watched")
@@ -310,19 +338,18 @@ def get_watched(device_id: str, media_type: MediaType = "movie"):
 @app.get("/api/genres")
 async def genres(
     media_type: MediaType = "movie",
-    language: str = Query(DEFAULT_LANG, description="Korte taalcode: en, nl, de, fr, es (standaard en)"),
+    language: str = Query(DEFAULT_LANG, description="Taalcode, bijv. en-US, nl-NL, de-DE, fr-FR, es-ES"),
 ):
     """Lijst van beschikbare genres voor films of tv-series, in de gevraagde taal."""
     if MOCK_MODE:
         return {"genres": [{"id": 18, "name": "Drama"}, {"id": 35, "name": "Comedy"}]}
-    lang = resolve_lang(language)
-    key = f"genre:{media_type}:{lang}"
-    cached = await cache_get(key, _mem_genre)
-    if cached is not _MISS:
+    cache_key = (media_type, language)
+    cached = await genre_cache.get(cache_key)
+    if cached is not MISS:
         return cached
     async with httpx.AsyncClient() as client:
-        data = await tmdb_get(client, f"/genre/{media_type}/list", language=lang)
-    await cache_set(key, data, TTL_GENRE, _mem_genre)
+        data = await tmdb_get(client, f"/genre/{media_type}/list", language=language)
+    await genre_cache.set(cache_key, data)
     return data
 
 
@@ -342,7 +369,7 @@ async def top30(
     device_id: Optional[str] = Query(None, description="Device-ID; nodig voor exclude_watched"),
     exclude_watched: bool = Query(False, description="Verberg titels die dit device al gezien heeft"),
     limit: int = Query(30, ge=1, le=100, description="Aantal titels in de lijst (bijv. 10 of 30)"),
-    language: str = Query(DEFAULT_LANG, description="Korte taalcode: en, nl, de, fr, es (standaard en)"),
+    language: str = Query(DEFAULT_LANG, description="Taalcode, bijv. en-US, nl-NL, de-DE, fr-FR, es-ES"),
 ):
     """
     Genereer een top-lijst op basis van de opgegeven filters.
@@ -351,28 +378,29 @@ async def top30(
     Met exclude_watched=true + device_id worden gezien titels weggelaten en schuift
     de lijst op, zodat je altijd een volle top krijgt van wat je nog niet zag.
     """
-    lang = resolve_lang(language)
     if MOCK_MODE:
         items = mock_items(media_type)
     else:
-        key = "list:" + ":".join(str(x) for x in (
-            media_type, genre_id, actor, director, year_min, year_max,
-            rating_min, rating_max, sort_by, min_votes, lang))
-        cached = await cache_get(key, _mem_list)
-        if cached is not _MISS:
+        cache_key = (media_type, genre_id, actor, director, year_min, year_max,
+                     rating_min, rating_max, sort_by, min_votes, language)
+        cached = await list_cache.get(cache_key)
+        if cached is not MISS:
             items = cached
         else:
             items = await fetch_from_tmdb(media_type, genre_id, actor, director,
                                           year_min, year_max, rating_min, rating_max,
-                                          min_votes, lang)
-            await cache_set(key, items, TTL_LIST, _mem_list)
+                                          min_votes, language)
+            await list_cache.set(cache_key, items)
 
-    # Samengesteld eindcijfer per titel berekenen (Bayesiaans, over actieve bronnen)
-    compute_composite(items)
+    # Samengesteld eindcijfer berekenen (werkt op kopieën; cache blijft schoon)
+    items = apply_scores(items)
 
     # Sorteren
     if sort_by == "rating":
-        items = sorted(items, key=lambda x: x.get("score") or 0, reverse=True)
+        # Op het samengestelde 'score', niet op de rauwe TMDB-rating.
+        # Titels zonder score belanden onderaan (-1).
+        items = sorted(items, key=lambda x: x["score"] if x["score"] is not None else -1.0,
+                       reverse=True)
     elif sort_by == "year_asc":
         items = sorted(items, key=lambda x: x["year"] or 0)
     else:
@@ -416,7 +444,7 @@ async def fetch_from_tmdb(media_type, genre_id, actor, director,
         "vote_count.gte": min_votes,
         "vote_average.gte": rating_min,
         "vote_average.lte": rating_max,
-        "language": resolve_lang(language),  # accepteert korte code én al-volledige code
+        "language": language,
     }
     if genre_id:
         params["with_genres"] = genre_id
