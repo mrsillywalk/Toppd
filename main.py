@@ -117,6 +117,7 @@ genre_cache = Cache("genre", ttl=86400, maxsize=8)
 list_cache = Cache("list", ttl=3600, maxsize=512)
 person_cache = Cache("person", ttl=86400, maxsize=1024)
 person_search_cache = Cache("psearch", ttl=86400, maxsize=512)  # suggesties tijdens typen
+detail_cache = Cache("detail", ttl=86400, maxsize=512)  # volledige info per titel
 
 MediaType = Literal["movie", "tv"]
 
@@ -400,6 +401,96 @@ async def search_person(
     payload = {"results": results}
     await person_search_cache.set(cache_key, payload)
     return payload
+
+
+def _shape_detail(media_type: str, data: dict) -> dict:
+    """Zet de rauwe TMDB-detailrespons om naar wat de app nodig heeft."""
+    credits = data.get("credits", {}) or {}
+    cast = [
+        {
+            "name": c.get("name"),
+            "character": c.get("character"),
+            "profile": f"https://image.tmdb.org/t/p/w185{c['profile_path']}"
+            if c.get("profile_path") else None,
+        }
+        for c in (credits.get("cast") or [])[:12]  # top 12 cast
+    ]
+
+    if media_type == "movie":
+        crew = credits.get("crew") or []
+        directors = [c["name"] for c in crew if c.get("job") == "Director"]
+        director = ", ".join(directors) if directors else None
+        date = data.get("release_date") or ""
+        title = data.get("title")
+        runtime = data.get("runtime")
+    else:
+        created = data.get("created_by") or []
+        director = ", ".join(c["name"] for c in created) if created else None
+        date = data.get("first_air_date") or ""
+        title = data.get("name")
+        ert = data.get("episode_run_time") or []
+        runtime = ert[0] if ert else None
+
+    imdb_id = data.get("imdb_id") or (data.get("external_ids") or {}).get("imdb_id")
+
+    return {
+        "id": data.get("id"),
+        "title": title,
+        "year": int(date[:4]) if date[:4].isdigit() else None,
+        "overview": data.get("overview"),
+        "poster": f"https://image.tmdb.org/t/p/w500{data['poster_path']}"
+        if data.get("poster_path") else None,
+        "backdrop": f"https://image.tmdb.org/t/p/w780{data['backdrop_path']}"
+        if data.get("backdrop_path") else None,
+        "genres": [g["name"] for g in (data.get("genres") or [])],
+        "runtime": runtime,
+        "director": director,
+        "cast": cast,
+        "tmdb_rating": data.get("vote_average"),
+        "vote_count": data.get("vote_count"),
+        "imdb_id": imdb_id,  # intern; wordt uit de app-respons gehaald
+    }
+
+
+@app.get("/api/detail")
+async def detail(
+    media_type: MediaType = "movie",
+    item_id: int = Query(..., description="TMDB-id van de film/serie"),
+    language: str = Query(DEFAULT_LANG, description="Taalcode"),
+    enrich: bool = Query(True, description="IMDb/RT via OMDb (alleen als OMDb-key is gezet)"),
+):
+    """Volledige info voor één titel: poster, scores, regisseur, cast, genres."""
+    if MOCK_MODE:
+        return {
+            "id": item_id, "title": "Mock titel", "year": 2020,
+            "overview": "Voorbeeldbeschrijving voor testen zonder API-key.",
+            "poster": None, "backdrop": None, "genres": ["Drama"],
+            "runtime": 120, "director": "Regisseur X",
+            "cast": [{"name": "Acteur A", "character": "Hoofdrol", "profile": None}],
+            "tmdb_rating": 8.0, "vote_count": 1000,
+        }
+
+    cache_key = (media_type, item_id, language)
+    cached = await detail_cache.get(cache_key)
+    if cached is not MISS:
+        base = cached
+    else:
+        async with httpx.AsyncClient() as client:
+            data = await tmdb_get(
+                client, f"/{media_type}/{item_id}",
+                language=language,
+                append_to_response="credits,external_ids",  # alles in één call
+            )
+        base = _shape_detail(media_type, data)
+        await detail_cache.set(cache_key, base)
+
+    # Verrijken staat buiten de cache: het hangt af van de OMDb-key.
+    result = {k: v for k, v in base.items() if k != "imdb_id"}
+    if enrich and OMDB_KEY:
+        async with httpx.AsyncClient() as client:
+            extra = await enrich_with_omdb(client, base.get("imdb_id") or "")
+        result.update({k: v for k, v in extra.items() if v})
+    return result
 
 
 @app.get("/api/top30")
